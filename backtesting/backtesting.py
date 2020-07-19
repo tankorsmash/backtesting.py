@@ -917,6 +917,10 @@ class _Broker:
             trade.sl = sl
 
 
+def global_maximize(stats: pd.Series, _key=""):
+    return stats[_key]
+
+
 class Backtest:
     """
     Backtest a particular (parameterized) strategy
@@ -948,9 +952,7 @@ class Backtest:
 
             df['Open'] = df['High'] = df['Low'] = df['Close']
 
-        The passed data frame can contain additional columns that
-        can be used by the strategy (e.g. sentiment info).
-        DataFrame index can be either a datetime index (timestamps)
+        DataFrame index can be either datetime index (timestamps)
         or a monotonic range index (i.e. a sequence of periods).
 
         `strategy` is a `backtesting.backtesting.Strategy`
@@ -960,7 +962,7 @@ class Backtest:
 
         `commission` is the commision ratio. E.g. if your broker's commission
         is 1% of trade value, set commission to `0.01`. Note, if you wish to
-        account for bid-ask spread, you can approximate doing so by increasing
+        account for bid-ask spread, you cam approximate doing so by increasing
         the commission, e.g. set it to `0.0002` for commission-less forex
         trading where the average spread is roughly 0.2‰ of asking price.
 
@@ -1157,16 +1159,14 @@ class Backtest:
         if not kwargs:
             raise ValueError('Need some strategy parameters to optimize')
 
-        maximize_key = None
         if isinstance(maximize, str):
-            maximize_key = str(maximize)
+
             stats = self._results if self._results is not None else self.run()
             if maximize not in stats:
                 raise ValueError('`maximize`, if str, must match a key in pd.Series '
                                  'result of backtest.run()')
 
-            def maximize(stats: pd.Series, _key=maximize):
-                return stats[_key]
+            maximize = partial(global_maximize, _key=maximize)
 
         elif not callable(maximize):
             raise TypeError('`maximize` must be str (a field of backtest.run() result '
@@ -1203,7 +1203,6 @@ class Backtest:
                           stacklevel=2)
 
         heatmap = pd.Series(np.nan,
-                            name=maximize_key,
                             index=pd.MultiIndex.from_tuples([p.values() for p in param_combos],
                                                             names=next(iter(param_combos)).keys()))
 
@@ -1223,30 +1222,24 @@ class Backtest:
         # in a copy-on-write manner, achieving better performance/RAM benefit.
         backtest_uuid = np.random.random()
         param_batches = list(_batch(param_combos))
-        Backtest._mp_backtests[backtest_uuid] = (self, param_batches, maximize)
+
+        #this `dict` type is shared across threads
+        shared_backtests = mp.Manager().dict()
+        shared_backtests[backtest_uuid] = (self, param_batches)
+
+
         try:
-            # If multiprocessing start method is 'fork' (i.e. on POSIX), use
-            # a pool of processes to compute results in parallel.
-            # Otherwise (i.e. on Windos), sequential computation will be "faster".
-            if mp.get_start_method(allow_none=False) == 'fork':
-                with ProcessPoolExecutor() as executor:
-                    futures = [executor.submit(Backtest._mp_task, backtest_uuid, i)
-                               for i in range(len(param_batches))]
-                    for future in _tqdm(as_completed(futures), total=len(futures)):
-                        batch_index, values = future.result()
-                        for value, params in zip(values, param_batches[batch_index]):
-                            heatmap[tuple(params.values())] = value
-            else:
-                if os.name == 'posix':
-                    warnings.warn("For multiprocessing support in `Backtest.optimize()` "
-                                  "set multiprocessing start method to 'fork'.")
-                for batch_index in _tqdm(range(len(param_batches))):
-                    _, values = Backtest._mp_task(backtest_uuid, batch_index)
+            with ProcessPoolExecutor() as executor:
+                futures = [executor.submit(Backtest._mp_task, backtest_uuid, i, shared_backtests, maximize)
+                           for i in range(len(param_batches))]
+                for future in _tqdm(as_completed(futures), total=len(futures)):
+                    batch_index, values = future.result()
                     for value, params in zip(values, param_batches[batch_index]):
                         heatmap[tuple(params.values())] = value
         finally:
-            del Backtest._mp_backtests[backtest_uuid]
+            del shared_backtests[backtest_uuid]
 
+        Backtest._mp_backtests = shared_backtests
         best_params = heatmap.idxmax()
 
         if pd.isnull(best_params):
@@ -1262,8 +1255,8 @@ class Backtest:
         return self._results
 
     @staticmethod
-    def _mp_task(backtest_uuid, batch_index):
-        bt, param_batches, maximize_func = Backtest._mp_backtests[backtest_uuid]
+    def _mp_task(backtest_uuid, batch_index, shared_backtests, maximize_func):
+        bt, param_batches = shared_backtests[backtest_uuid]
         return batch_index, [maximize_func(stats) if stats['# Trades'] else np.nan
                              for stats in (bt.run(**params)
                                            for params in param_batches[batch_index])]
